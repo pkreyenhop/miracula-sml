@@ -45,6 +45,7 @@ and node =
   | ZFGenerator of parsed_pattern * qualifier list * node * node * (node StringMap.map)
   | ZF of node * qualifier list
   | Proj of int * node
+  | Char of char
 
 and parsed_pattern =
     PatInt of int
@@ -52,6 +53,7 @@ and parsed_pattern =
   | PatNil
   | PatCons of parsed_pattern * parsed_pattern
   | PatTuple of parsed_pattern list
+  | PatChar of char
 
 and qualifier =
     Generator of parsed_pattern * node
@@ -77,6 +79,7 @@ datatype token =
   | TOK_PIPE | TOK_LARROW | TOK_SEMICOLON
   | TOK_EQ | TOK_NE | TOK_LT | TOK_GT | TOK_LE | TOK_GE
   | TOK_MOD | TOK_IF
+  | TOK_CHAR of char | TOK_STRING of string | TOK_PP
 
 local
     fun isDigit c = Char.isDigit c
@@ -122,11 +125,56 @@ in
                             else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
                         else if c = #"*"  then loop (i + 1) (TOK_MUL :: acc)
                         else if c = #":"  then loop (i + 1) (TOK_COLON :: acc)
-                        else if c = #"+"  then loop (i + 1) (TOK_ADD :: acc)
+                        else if c = #"+"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"+"
+                            then loop (i + 2) (TOK_PP :: acc)
+                            else loop (i + 1) (TOK_ADD :: acc)
                         else if c = #"-"  then
                             if i + 1 < size andalso String.sub(str, i+1) = #">"
                             then loop (i + 2) (TOK_ARROW :: acc)
                             else loop (i + 1) (TOK_SUB :: acc)
+                        else if c = #"'" then
+                            if i + 2 < size andalso String.sub(str, i+1) <> #"\\" andalso String.sub(str, i+2) = #"'" then
+                                loop (i + 3) (TOK_CHAR (String.sub(str, i+1)) :: acc)
+                            else if i + 3 < size andalso String.sub(str, i+1) = #"\\" andalso String.sub(str, i+3) = #"'" then
+                                let
+                                    val esc = String.sub(str, i+2)
+                                    val ch = case esc of
+                                                 #"n" => #"\n"
+                                               | #"t" => #"\t"
+                                               | #"'" => #"'"
+                                               | #"\\" => #"\\"
+                                               | _ => esc
+                                in
+                                    loop (i + 4) (TOK_CHAR ch :: acc)
+                                end
+                            else (print "Lex error: invalid char literal\n"; loop (i+1) acc)
+                        else if c = #"\"" then
+                            let
+                                fun readStr j s =
+                                    if j >= size then (j, s)
+                                    else
+                                        let val c' = String.sub(str, j) in
+                                            if c' = #"\"" then (j + 1, s)
+                                            else if c' = #"\\" andalso j + 1 < size then
+                                                let
+                                                    val esc = String.sub(str, j+1)
+                                                    val ch = case esc of
+                                                                 #"n" => #"\n"
+                                                               | #"t" => #"\t"
+                                                               | #"\"" => #"\""
+                                                               | #"\\" => #"\\"
+                                                               | _ => esc
+                                                in
+                                                    readStr (j + 2) (s ^ String.str ch)
+                                                end
+                                            else
+                                                readStr (j + 1) (s ^ String.str c')
+                                        end
+                                val (nextJ, s) = readStr (i + 1) ""
+                            in
+                                loop nextJ (TOK_STRING s :: acc)
+                            end
                         else if isDigit c then
                             let
                                 fun readNum j s =
@@ -135,7 +183,7 @@ in
                                     else (j, valOf (Int.fromString s))
                                 val (nextJ, v) = readNum (i + 1) (String.str c)
                             in loop nextJ (TOK_INT v :: acc) end
-                        else if Char.isAlpha c then
+                        else if Char.isAlpha c orelse c = #"_" then
                             let
                                 fun readVar j s =
                                     if j < size andalso isAlphaNum (String.sub(str, j))
@@ -210,9 +258,16 @@ fun parse tokens =
               | _ => parse_cons ()
 
         and parse_cons () =
-            let val left = parse_comp () in
+            let val left = parse_pp () in
                 case peek () of
                     TOK_COLON => (consume (); Cons (left, parse_cons ()))
+                  | _ => left
+            end
+
+        and parse_pp () =
+            let val left = parse_comp () in
+                case peek () of
+                    TOK_PP => (consume (); Append (left, parse_pp ()))
                   | _ => left
             end
 
@@ -248,6 +303,8 @@ fun parse tokens =
             let fun loop left =
                 case peek () of
                     TOK_INT _ => loop (App (left, parse_atom ()))
+                  | TOK_CHAR _ => loop (App (left, parse_atom ()))
+                  | TOK_STRING _ => loop (App (left, parse_atom ()))
                   | TOK_VAR _ => loop (App (left, parse_atom ()))
                   | TOK_LPAREN => loop (App (left, parse_atom ()))
                   | TOK_LBRACK => loop (App (left, parse_atom ()))
@@ -257,6 +314,15 @@ fun parse tokens =
         and parse_atom () =
             case peek () of
                 TOK_INT n => (consume (); Int n)
+              | TOK_CHAR c => (consume (); Char c)
+              | TOK_STRING s =>
+                let
+                    fun make_list [] = Nil
+                      | make_list (c :: cs) = Cons (Char c, make_list cs)
+                in
+                    consume ();
+                    make_list (String.explode s)
+                end
               | TOK_VAR x => (consume (); Var x)
               | TOK_LPAREN =>
                 if peek2 () = SOME TOK_COLON then
@@ -375,6 +441,7 @@ fun parse tokens =
         and parse_pattern () =
             case peek () of
                 TOK_INT n => (consume (); PatInt n)
+              | TOK_CHAR c => (consume (); PatChar c)
               | TOK_VAR x => (consume (); PatVar x)
               | TOK_LBRACK =>
                 (consume ();
@@ -435,6 +502,7 @@ fun parse tokens =
 fun match_pattern env pat node =
     case (pat, whnf env node) of
         (PatInt n1, Int n2) => if n1 = n2 then SOME StringMap.empty else NONE
+      | (PatChar c1, Char c2) => if c1 = c2 then SOME StringMap.empty else NONE
       | (PatVar "_", _) => SOME StringMap.empty
       | (PatVar x, v) => SOME (StringMap.singleton (x, v))
       | (PatNil, Nil) => SOME StringMap.empty
@@ -462,6 +530,7 @@ and eval_zf env body_expr qualifiers =
         [] =>
         let
             fun needs_thunk (Int _) = false
+              | needs_thunk (Char _) = false
               | needs_thunk Nil = false
               | needs_thunk (Thunk _) = false
               | needs_thunk (Closure _) = false
@@ -484,11 +553,13 @@ and eval_zf env body_expr qualifiers =
 and whnf (env : env) (n : node) : node =
     case n of
         Int n => Int n
+      | Char c => Char c
       | Lam (x, body) => Closure (x, body, env)
       | Closure (x, body, closure_env) => Closure (x, body, closure_env)
       | Cons (h, t) =>
         let
             fun needs_thunk (Int _) = false
+              | needs_thunk (Char _) = false
               | needs_thunk Nil = false
               | needs_thunk (Thunk _) = false
               | needs_thunk (Closure _) = false
@@ -506,7 +577,8 @@ and whnf (env : env) (n : node) : node =
       | Eq (e1, e2) =>
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => if n1 = n2 then Int 1 else Int 0
-           | _ => raise RuntimeError "Equality expects integers")
+           | (Char c1, Char c2) => if c1 = c2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Equality expects integers or characters")
       | Ne (e1, e2) =>
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => if n1 <> n2 then Int 1 else Int 0
@@ -534,6 +606,7 @@ and whnf (env : env) (n : node) : node =
       | Tuple elms =>
         let
             fun needs_thunk (Int _) = false
+              | needs_thunk (Char _) = false
               | needs_thunk Nil = false
               | needs_thunk (Thunk _) = false
               | needs_thunk (Closure _) = false
@@ -692,16 +765,52 @@ fun print_node env node =
       | MatchError => "<match-error>"
       | Thunk _ => "<thunk>"
       | Range (e1, e2) => "[" ^ print_node env e1 ^ ".." ^ print_node env e2 ^ "]"
+      | Char c =>
+        let
+            fun escape ch =
+                if ch = #"\n" then "\\n"
+                else if ch = #"\t" then "\\t"
+                else if ch = #"'" then "\\'"
+                else if ch = #"\\" then "\\\\"
+                else String.str ch
+        in
+            "'" ^ escape c ^ "'"
+        end
       | Nil => "[]"
       | Cons _ =>
         let
-            fun collect elements current =
+            fun check_string current acc =
                 case whnf env current of
-                    Cons (h, t) => collect (print_node env (whnf env h) :: elements) t
-                  | Nil => List.rev elements
-                  | rest => List.rev (print_node env (whnf env rest) :: elements)
+                    Nil => SOME (String.implode (List.rev acc))
+                  | Cons (h, t) =>
+                    (case whnf env h of
+                         Char c => check_string t (c :: acc)
+                       | _ => NONE)
+                  | _ => NONE
         in
-            "[" ^ String.concatWith "," (collect [] node) ^ "]"
+            case check_string node [] of
+                SOME "" => "[]"
+              | SOME s =>
+                let
+                    fun escape ch =
+                        if ch = #"\n" then "\\n"
+                        else if ch = #"\t" then "\\t"
+                        else if ch = #"\"" then "\\\""
+                        else if ch = #"\\" then "\\\\"
+                        else String.str ch
+                in
+                    "\"" ^ String.translate escape s ^ "\""
+                end
+              | NONE =>
+                let
+                    fun collect elements current =
+                        case whnf env current of
+                            Cons (h, t) => collect (print_node env (whnf env h) :: elements) t
+                          | Nil => List.rev elements
+                          | rest => List.rev (print_node env (whnf env rest) :: elements)
+                in
+                    "[" ^ String.concatWith "," (collect [] node) ^ "]"
+                end
         end
       | Proj (i, _) => "<projection-" ^ Int.toString i ^ ">"
 
@@ -742,6 +851,8 @@ fun desugar_equations (eqs : raw_binding list) : node =
                         (case pat of
                              PatInt target_val =>
                              IfZero (Sub (Var p, Int target_val), check_pats p_rest pat_rest tree_body, build_decision_tree rest)
+                           | PatChar target_val =>
+                             IfZero (Sub (Eq (Var p, Char target_val), Int 1), check_pats p_rest pat_rest tree_body, build_decision_tree rest)
                            | PatVar binding_name =>
                              let val substituted_body = 
                                      if binding_name = p then tree_body
@@ -782,6 +893,7 @@ fun desugar_equations (eqs : raw_binding list) : node =
 fun print_ast node =
     case node of
         Int n => "Int " ^ Int.toString n
+      | Char c => "Char '" ^ String.str c ^ "'"
       | Var x => "Var " ^ x
       | Lam (x, body) => "Lam (" ^ x ^ ", " ^ print_ast body ^ ")"
       | Closure (x, body, _) => "Closure (" ^ x ^ ", " ^ print_ast body ^ ")"
