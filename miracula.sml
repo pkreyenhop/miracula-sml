@@ -23,6 +23,7 @@ and node =
   | App of node * node
   | Sub of node * node
   | Add of node * node
+  | Mul of node * node
   | IfZero of node * node * node
   | Cons of node * node
   | Nil
@@ -31,6 +32,30 @@ and node =
   | MatchError
   | Closure of string * node * (node StringMap.map)
   | Thunk of thunk_state ref
+  | Eq of node * node
+  | Ne of node * node
+  | Lt of node * node
+  | Gt of node * node
+  | Le of node * node
+  | Ge of node * node
+  | Mod of node * node
+  | Tuple of node list
+  | If of node * node * node
+  | Append of node * node
+  | ZFGenerator of parsed_pattern * qualifier list * node * node * (node StringMap.map)
+  | ZF of node * qualifier list
+  | Proj of int * node
+
+and parsed_pattern =
+    PatInt of int
+  | PatVar of string
+  | PatNil
+  | PatCons of parsed_pattern * parsed_pattern
+  | PatTuple of parsed_pattern list
+
+and qualifier =
+    Generator of parsed_pattern * node
+  | Filter of node
 
 type env = node StringMap.map
 
@@ -44,11 +69,14 @@ exception RuntimeError of string
 datatype token =
     TOK_LAMBDA | TOK_DOT | TOK_DOTDOT | TOK_ARROW | TOK_ASSIGN
   | TOK_LPAREN | TOK_RPAREN | TOK_LBRACK | TOK_RBRACK | TOK_COMMA | TOK_COLON
-  | TOK_SUB | TOK_ADD
+  | TOK_SUB | TOK_ADD | TOK_MUL
   | TOK_IFZERO | TOK_THEN | TOK_ELSE
   | TOK_INT of int
   | TOK_VAR of string
   | TOK_EOF
+  | TOK_PIPE | TOK_LARROW | TOK_SEMICOLON
+  | TOK_EQ | TOK_NE | TOK_LT | TOK_GT | TOK_LE | TOK_GE
+  | TOK_MOD | TOK_IF
 
 local
     fun isDigit c = Char.isDigit c
@@ -72,7 +100,27 @@ in
                         else if c = #"["  then loop (i + 1) (TOK_LBRACK :: acc)
                         else if c = #"]"  then loop (i + 1) (TOK_RBRACK :: acc)
                         else if c = #","  then loop (i + 1) (TOK_COMMA :: acc)
-                        else if c = #"="  then loop (i + 1) (TOK_ASSIGN :: acc)
+                        else if c = #";"  then loop (i + 1) (TOK_SEMICOLON :: acc)
+                        else if c = #"|"  then loop (i + 1) (TOK_PIPE :: acc)
+                        else if c = #"<"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"-"
+                            then loop (i + 2) (TOK_LARROW :: acc)
+                            else if i + 1 < size andalso String.sub(str, i+1) = #"="
+                            then loop (i + 2) (TOK_LE :: acc)
+                            else loop (i + 1) (TOK_LT :: acc)
+                        else if c = #">"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"="
+                            then loop (i + 2) (TOK_GE :: acc)
+                            else loop (i + 1) (TOK_GT :: acc)
+                        else if c = #"="  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"="
+                            then loop (i + 2) (TOK_EQ :: acc)
+                            else loop (i + 1) (TOK_ASSIGN :: acc)
+                        else if c = #"!"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"="
+                            then loop (i + 2) (TOK_NE :: acc)
+                            else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
+                        else if c = #"*"  then loop (i + 1) (TOK_MUL :: acc)
                         else if c = #":"  then loop (i + 1) (TOK_COLON :: acc)
                         else if c = #"+"  then loop (i + 1) (TOK_ADD :: acc)
                         else if c = #"-"  then
@@ -96,8 +144,10 @@ in
                                 val (nextJ, s) = readVar (i + 1) (String.str c)
                                 val tok = case s of
                                               "ifzero" => TOK_IFZERO
+                                            | "if"     => TOK_IF
                                             | "then"   => TOK_THEN
                                             | "else"   => TOK_ELSE
+                                            | "mod"    => TOK_MOD
                                             | _        => TOK_VAR s
                             in loop nextJ (tok :: acc) end
                         else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
@@ -109,11 +159,7 @@ end
 (* 3. PARSER MECHANICS                                                       *)
 (* ========================================================================== *)
 
-datatype parsed_pattern =
-    PatInt of int
-  | PatVar of string
-  | PatNil
-  | PatCons of parsed_pattern * parsed_pattern
+(* parsed_pattern is now defined with node *)
 
 type raw_binding = { fname: string, pats: parsed_pattern list, body: node }
 datatype stmt = ScriptBind of raw_binding | REPLEval of node
@@ -152,22 +198,51 @@ fun parse tokens =
                      val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
                      val f_branch = parse_expr ()
                  in IfZero (cond, t_branch, f_branch) end)
+              | TOK_IF =>
+                (consume ();
+                 let
+                     val cond = parse_expr ()
+                     val _ = if peek () <> TOK_THEN then raise Fail "Expected 'then'" else consume ()
+                     val t_branch = parse_expr ()
+                     val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
+                     val f_branch = parse_expr ()
+                 in If (cond, t_branch, f_branch) end)
               | _ => parse_cons ()
 
         and parse_cons () =
-            let val left = parse_add_sub () in
+            let val left = parse_comp () in
                 case peek () of
                     TOK_COLON => (consume (); Cons (left, parse_cons ()))
+                  | _ => left
+            end
+
+        and parse_comp () =
+            let val left = parse_add_sub () in
+                case peek () of
+                    TOK_EQ => (consume (); Eq (left, parse_add_sub ()))
+                  | TOK_NE => (consume (); Ne (left, parse_add_sub ()))
+                  | TOK_LT => (consume (); Lt (left, parse_add_sub ()))
+                  | TOK_GT => (consume (); Gt (left, parse_add_sub ()))
+                  | TOK_LE => (consume (); Le (left, parse_add_sub ()))
+                  | TOK_GE => (consume (); Ge (left, parse_add_sub ()))
                   | _ => left
             end
 
         and parse_add_sub () =
             let fun loop left =
                 case peek () of
-                    TOK_ADD => (consume (); loop (Add (left, parse_app ())))
-                  | TOK_SUB => (consume (); loop (Sub (left, parse_app ())))
+                    TOK_ADD => (consume (); loop (Add (left, parse_mod ())))
+                  | TOK_SUB => (consume (); loop (Sub (left, parse_mod ())))
                   | _ => left
-            in loop (parse_app ()) end
+            in loop (parse_mod ()) end
+
+        and parse_mod () =
+            let val left = parse_app () in
+                case peek () of
+                    TOK_MOD => (consume (); Mod (left, parse_app ()))
+                  | TOK_MUL => (consume (); Mul (left, parse_app ()))
+                  | _ => left
+            end
 
         and parse_app () =
             let fun loop left =
@@ -195,10 +270,23 @@ fun parse tokens =
                      Lam ("x", Lam ("y", Sub (Var "x", Var "y"))))
                 else
                     (consume ();
-                     let val e = parse_expr () in
-                         if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
-                         consume ();
-                         e
+                     let
+                         fun parse_tuple_elms acc =
+                             let val e = parse_expr () in
+                                 case peek () of
+                                     TOK_COMMA => (consume (); parse_tuple_elms (e :: acc))
+                                   | TOK_RPAREN => (consume (); List.rev (e :: acc))
+                                   | _ => raise Fail "Expected ',' or ')' inside tuple"
+                             end
+                         val first = parse_expr ()
+                     in
+                         if peek () = TOK_COMMA then
+                             (consume ();
+                              Tuple (parse_tuple_elms [first]))
+                         else
+                             (if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
+                              consume ();
+                              first)
                      end)
               | TOK_LBRACK => (consume (); parse_list_elements ())
               | _ => raise Fail "Unexpected token inside atom expression"
@@ -207,7 +295,42 @@ fun parse tokens =
             if peek () = TOK_RBRACK then (consume (); Nil)
             else
                 let val head = parse_expr () in
-                    if peek () = TOK_DOTDOT then
+                    if peek () = TOK_PIPE then
+                        (consume ();
+                         let
+                             fun has_larrow () =
+                                 let
+                                     fun check [] = false
+                                       | check (TOK_SEMICOLON :: _) = false
+                                       | check (TOK_RBRACK :: _) = false
+                                       | check (TOK_LARROW :: _) = true
+                                       | check (_ :: rest) = check rest
+                                 in
+                                     check (!toks)
+                                 end
+                             fun parse_qualifiers () =
+                                 let
+                                     val q = if has_larrow () then
+                                                 let
+                                                     val pat = parse_pattern ()
+                                                     val _ = if peek () <> TOK_LARROW then raise Fail "Expected '<-'" else consume ()
+                                                     val src = parse_expr ()
+                                                 in
+                                                     Generator (pat, src)
+                                                 end
+                                             else
+                                                 Filter (parse_expr ())
+                                 in
+                                     case peek () of
+                                         TOK_SEMICOLON => (consume (); q :: parse_qualifiers ())
+                                       | TOK_RBRACK => (consume (); [q])
+                                       | _ => raise Fail "Expected ';' or ']' in qualifiers"
+                                 end
+                             val quals = parse_qualifiers ()
+                         in
+                             ZF (head, quals)
+                         end)
+                    else if peek () = TOK_DOTDOT then
                         (consume ();
                          let val tail_expr = parse_expr () in
                              if peek () <> TOK_RBRACK then raise Fail "Expected ']' after range expression" else ();
@@ -216,16 +339,16 @@ fun parse tokens =
                          end)
                     else if peek () = TOK_COMMA then (consume (); Cons (head, parse_list_elements ()))
                     else if peek () = TOK_RBRACK then (consume (); Cons (head, Nil))
-                    else raise Fail "Expected '..', ',', or ']' in list expression"
+                    else raise Fail "Expected '|', '..', ',', or ']' in list expression"
                 end
 
-        fun is_assignment ts =
+        and is_assignment ts =
             let fun check [] = false
                   | check (TOK_ASSIGN :: _) = true
                   | check (_ :: rest) = check rest
             in check ts end
 
-        fun parse_pattern () =
+        and parse_pattern () =
             case peek () of
                 TOK_INT n => (consume (); PatInt n)
               | TOK_VAR x => (consume (); PatVar x)
@@ -235,10 +358,23 @@ fun parse tokens =
                  else raise Fail "Only empty list pattern '[]' is supported directly")
               | TOK_LPAREN =>
                 (consume ();
-                 let val p = parse_pattern_cons () in
-                     if peek () <> TOK_RPAREN then raise Fail "Expected ')' in pattern" else ();
-                     consume ();
-                     p
+                 let
+                     fun parse_tuple_pats acc =
+                         let val p = parse_pattern_cons () in
+                             case peek () of
+                                 TOK_COMMA => (consume (); parse_tuple_pats (p :: acc))
+                               | TOK_RPAREN => (consume (); List.rev (p :: acc))
+                               | _ => raise Fail "Expected ',' or ')' inside tuple pattern"
+                         end
+                     val first = parse_pattern_cons ()
+                 in
+                     if peek () = TOK_COMMA then
+                         (consume ();
+                          PatTuple (parse_tuple_pats [first]))
+                     else
+                         (if peek () <> TOK_RPAREN then raise Fail "Expected ')' in pattern" else ();
+                          consume ();
+                          first)
                  end)
               | _ => raise Fail "Malformed pattern in equation left hand side"
 
@@ -272,27 +408,156 @@ fun parse tokens =
 (* 4. RUNTIME WORKSPACE                                                      *)
 (* ========================================================================== *)
 
-fun whnf (env : env) (n : node) : node =
+fun match_pattern env pat node =
+    case (pat, whnf env node) of
+        (PatInt n1, Int n2) => if n1 = n2 then SOME StringMap.empty else NONE
+      | (PatVar "_", _) => SOME StringMap.empty
+      | (PatVar x, v) => SOME (StringMap.singleton (x, v))
+      | (PatNil, Nil) => SOME StringMap.empty
+      | (PatCons (p1, p2), Cons (h, t)) =>
+        (case (match_pattern env p1 h, match_pattern env p2 t) of
+             (SOME m1, SOME m2) => SOME (StringMap.unionWith (fn (v1, v2) => v2) (m1, m2))
+           | _ => NONE)
+      | (PatTuple pats, Tuple nodes) =>
+        if List.length pats = List.length nodes then
+            let
+                fun match_list [] [] acc = SOME acc
+                  | match_list (p::ps) (n::ns) acc =
+                    (case match_pattern env p n of
+                         SOME m => match_list ps ns (StringMap.unionWith (fn (v1, v2) => v2) (acc, m))
+                       | NONE => NONE)
+                  | match_list _ _ _ = NONE
+            in
+                match_list pats nodes StringMap.empty
+            end
+        else NONE
+      | _ => NONE
+
+and eval_zf env body_expr qualifiers =
+    case qualifiers of
+        [] =>
+        let
+            fun needs_thunk (Int _) = false
+              | needs_thunk Nil = false
+              | needs_thunk (Thunk _) = false
+              | needs_thunk (Closure _) = false
+              | needs_thunk (Lam _) = false
+              | needs_thunk MatchError = false
+              | needs_thunk _ = true
+            val h = if needs_thunk body_expr then Thunk (ref (Unevaluated (body_expr, env))) else body_expr
+        in
+            Cons (h, Nil)
+        end
+      | Filter cond :: rest =>
+        let
+            val cond' = Thunk (ref (Unevaluated (cond, env)))
+        in
+            If (cond', eval_zf env body_expr rest, Nil)
+        end
+      | Generator (pat, src) :: rest =>
+        ZFGenerator (pat, rest, src, body_expr, env)
+
+and whnf (env : env) (n : node) : node =
     case n of
         Int n => Int n
       | Lam (x, body) => Closure (x, body, env)
       | Closure (x, body, closure_env) => Closure (x, body, closure_env)
       | Cons (h, t) =>
         let
-            fun needs_thunk (Var _) = true
-              | needs_thunk (App _) = true
-              | needs_thunk (Sub _) = true
-              | needs_thunk (Add _) = true
-              | needs_thunk (IfZero _) = true
-              | needs_thunk (IfNil _) = true
-              | needs_thunk (Range _) = true
-              | needs_thunk _ = false
+            fun needs_thunk (Int _) = false
+              | needs_thunk Nil = false
+              | needs_thunk (Thunk _) = false
+              | needs_thunk (Closure _) = false
+              | needs_thunk (Lam _) = false
+              | needs_thunk (Cons _) = false
+              | needs_thunk (Tuple _) = false
+              | needs_thunk MatchError = false
+              | needs_thunk _ = true
             val h' = if needs_thunk h then Thunk (ref (Unevaluated (h, env))) else h
             val t' = if needs_thunk t then Thunk (ref (Unevaluated (t, env))) else t
         in
             Cons (h', t')
         end
       | Nil => Nil
+      | Eq (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 = n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Equality expects integers")
+      | Ne (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 <> n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Inequality expects integers")
+      | Lt (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 < n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Less-than expects integers")
+      | Gt (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 > n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Greater-than expects integers")
+      | Le (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 <= n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Less-than-or-equal expects integers")
+      | Ge (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => if n1 >= n2 then Int 1 else Int 0
+           | _ => raise RuntimeError "Greater-than-or-equal expects integers")
+      | Mod (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => Int (n1 mod n2)
+           | _ => raise RuntimeError "Modulo expects integers")
+      | Tuple elms =>
+        let
+            fun needs_thunk (Int _) = false
+              | needs_thunk Nil = false
+              | needs_thunk (Thunk _) = false
+              | needs_thunk (Closure _) = false
+              | needs_thunk (Lam _) = false
+              | needs_thunk (Cons _) = false
+              | needs_thunk (Tuple _) = false
+              | needs_thunk MatchError = false
+              | needs_thunk _ = true
+            val elms' = List.map (fn e => if needs_thunk e then Thunk (ref (Unevaluated (e, env))) else e) elms
+        in
+            Tuple elms'
+        end
+      | If (cond, t_branch, f_branch) =>
+        (case whnf env cond of
+             Int 0 => whnf env f_branch
+           | Int _ => whnf env t_branch
+           | _ => raise RuntimeError "If condition must be an integer")
+      | Append (e1, e2) =>
+        (case whnf env e1 of
+             Nil => whnf env e2
+           | Cons (h, t) =>
+             let
+                 val t' = Thunk (ref (Unevaluated (Append (t, e2), env)))
+             in
+                 Cons (h, t')
+             end
+           | _ => raise RuntimeError "Append expects lists")
+      | ZF (body_expr, qualifiers) =>
+        whnf env (eval_zf env body_expr qualifiers)
+      | ZFGenerator (pat, rest, current_list, body_expr, zf_env) =>
+        (case whnf zf_env current_list of
+             Nil => Nil
+           | Cons (h, t) =>
+             let
+                 val match_res = match_pattern zf_env pat h
+                 val next_gen = ZFGenerator (pat, rest, t, body_expr, zf_env)
+             in
+                 case match_res of
+                     SOME bindings =>
+                     let
+                          val extended_env = StringMap.foldli (fn (k, v, acc) => StringMap.insert (acc, k, v)) zf_env bindings
+                          val first_list = eval_zf extended_env body_expr rest
+                     in
+                         whnf env (Append (first_list, next_gen))
+                     end
+                   | NONE => whnf env next_gen
+             end
+             | _ => raise RuntimeError "Generator source must be a list")
       | Var x =>
         if x = "hd" orelse x = "tl" then Var x
         else
@@ -340,6 +605,10 @@ fun whnf (env : env) (n : node) : node =
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => Int (n1 + n2)
            | _ => raise RuntimeError "Addition expects integers")
+      | Mul (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) => Int (n1 * n2)
+           | _ => raise RuntimeError "Multiplication expects integers")
       | IfZero (cond, t_branch, f_branch) =>
         (case whnf env cond of
              Int 0 => whnf env t_branch
@@ -357,6 +626,10 @@ fun whnf (env : env) (n : node) : node =
              else Cons (Int n1, Thunk (ref (Unevaluated (Range (Int (n1 + 1), e2), env))))
            | _ => raise RuntimeError "Range bounds must evaluate to integers")
       | MatchError => raise RuntimeError "Pattern matching exhausted"
+      | Proj (i, tpl) =>
+        (case whnf env tpl of
+             Tuple elms => whnf env (List.nth (elms, i))
+           | _ => raise RuntimeError "Proj expects a tuple")
       | Thunk r =>
         (case !r of
              Evaluated n' => n'
@@ -377,8 +650,21 @@ fun print_node env node =
       | App (e1, e2) => "(" ^ print_node env e1 ^ " " ^ print_node env e2 ^ ")"
       | Sub (e1, e2) => "(" ^ print_node env e1 ^ " - " ^ print_node env e2 ^ ")"
       | Add (e1, e2) => "(" ^ print_node env e1 ^ " + " ^ print_node env e2 ^ ")"
+      | Mul (e1, e2) => "(" ^ print_node env e1 ^ " * " ^ print_node env e2 ^ ")"
+      | Eq (e1, e2) => "(" ^ print_node env e1 ^ " == " ^ print_node env e2 ^ ")"
+      | Ne (e1, e2) => "(" ^ print_node env e1 ^ " != " ^ print_node env e2 ^ ")"
+      | Lt (e1, e2) => "(" ^ print_node env e1 ^ " < " ^ print_node env e2 ^ ")"
+      | Gt (e1, e2) => "(" ^ print_node env e1 ^ " > " ^ print_node env e2 ^ ")"
+      | Le (e1, e2) => "(" ^ print_node env e1 ^ " <= " ^ print_node env e2 ^ ")"
+      | Ge (e1, e2) => "(" ^ print_node env e1 ^ " >= " ^ print_node env e2 ^ ")"
+      | Mod (e1, e2) => "(" ^ print_node env e1 ^ " mod " ^ print_node env e2 ^ ")"
+      | Tuple elms => "(" ^ String.concatWith "," (List.map (fn e => print_node env (whnf env e)) elms) ^ ")"
       | IfZero _ => "<conditional>"
+      | If _ => "<conditional>"
       | IfNil _ => "<conditional-nil>"
+      | Append _ => "<append>"
+      | ZF _ => "<zf-comprehension>"
+      | ZFGenerator _ => "<zf-generator>"
       | MatchError => "<match-error>"
       | Thunk _ => "<thunk>"
       | Range (e1, e2) => "[" ^ print_node env e1 ^ ".." ^ print_node env e2 ^ "]"
@@ -393,6 +679,7 @@ fun print_node env node =
         in
             "[" ^ String.concatWith "," (collect [] node) ^ "]"
         end
+      | Proj (i, _) => "<projection-" ^ Int.toString i ^ ">"
 
 (* ========================================================================== *)
 (* 5. DESUGARER LOGIC FOR STRINGS                                            *)
@@ -436,6 +723,16 @@ fun desugar_equations (eqs : raw_binding list) : node =
                                      if binding_name = p then tree_body
                                      else App (Lam (binding_name, tree_body), Var p)
                              in check_pats p_rest pat_rest substituted_body end
+                           | PatTuple tuple_pats =>
+                             let
+                                 val elms_vars = List.tabulate (List.length tuple_pats, fn i => new_var_name ("t" ^ Int.toString i))
+                                 val inner_body = check_pats (elms_vars @ p_rest) (tuple_pats @ pat_rest) tree_body
+                                 fun wrap_projs [] _ body = body
+                                   | wrap_projs (var :: rest_vars) i body =
+                                     App (Lam (var, wrap_projs rest_vars (i+1) body), Proj (i, Var p))
+                             in
+                                 wrap_projs elms_vars 0 inner_body
+                             end
                            | PatNil =>
                              IfNil (Var p, check_pats p_rest pat_rest tree_body, build_decision_tree rest)
                            | PatCons (head_pat, tail_pat) =>
@@ -467,6 +764,7 @@ fun print_ast node =
       | App (e1, e2) => "App (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Sub (e1, e2) => "Sub (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Add (e1, e2) => "Add (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Mul (e1, e2) => "Mul (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | IfZero (c, t, f) => "IfZero (" ^ print_ast c ^ ", " ^ print_ast t ^ ", " ^ print_ast f ^ ")"
       | IfNil (c, t, f) => "IfNil (" ^ print_ast c ^ ", " ^ print_ast t ^ ", " ^ print_ast f ^ ")"
       | MatchError => "MatchError"
@@ -474,6 +772,19 @@ fun print_ast node =
       | Cons (h, t) => "Cons (" ^ print_ast h ^ ", " ^ print_ast t ^ ")"
       | Range (e1, e2) => "Range (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Thunk _ => "Thunk"
+      | Eq (e1, e2) => "Eq (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Ne (e1, e2) => "Ne (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Lt (e1, e2) => "Lt (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Gt (e1, e2) => "Gt (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Le (e1, e2) => "Le (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Ge (e1, e2) => "Ge (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Mod (e1, e2) => "Mod (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Tuple elms => "Tuple [" ^ String.concatWith "," (List.map print_ast elms) ^ "]"
+      | If (c, t, f) => "If (" ^ print_ast c ^ ", " ^ print_ast t ^ ", " ^ print_ast f ^ ")"
+      | Append (e1, e2) => "Append (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | ZF (body, quals) => "ZF (" ^ print_ast body ^ ")"
+      | ZFGenerator _ => "ZFGenerator"
+      | Proj (i, e) => "Proj (" ^ Int.toString i ^ ", " ^ print_ast e ^ ")"
 
 fun load_script_file filename env =
     let
