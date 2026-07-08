@@ -449,7 +449,10 @@ fun load_script_file filename env =
             let val ins = TextIO.openIn name in TextIO.closeIn ins; true end handle _ => false
     in
         if not (file_exists filename) then
-            (print ("Script file '" ^ filename ^ "' not found. Starting with empty space.\n"); env)
+            if filename = "stdenv.m" then
+                (print ("Standard environment file 'stdenv.m' not found. Skipping.\n"); env)
+            else
+                (print ("Script file '" ^ filename ^ "' not found. Starting with empty space.\n"); env)
         else
             let
                 val ic = TextIO.openIn filename
@@ -776,7 +779,8 @@ fun repl (env : env, history : string list) =
                     val _ = print "Opening vi script.m ...\n"
                     val _ = OS.Process.system "vi script.m"
                     val _ = print "Reloading environment profiles from script.m...\n"
-                    val reloaded_env = load_script_file "script.m" StringMap.empty
+                    val env_with_std = load_script_file "stdenv.m" StringMap.empty
+                    val reloaded_env = load_script_file "script.m" env_with_std
                 in repl (reloaded_env, history) end
             else if is_empty line_trimmed then
                 repl (env, history)
@@ -820,7 +824,8 @@ fun main () =
         val _ = print " Use '/e' to edit script.m, '/q' to exit          \n"
         val _ = print "==================================================\n"
         (* val _ = CM.make "$smlnj-lib.cm" (* Force dynamic instantiation *) *)
-        val initial_env = load_script_file "script.m" StringMap.empty
+        val env_with_std = load_script_file "stdenv.m" StringMap.empty
+        val initial_env = load_script_file "script.m" env_with_std
     in
         repl (initial_env, [])
     end

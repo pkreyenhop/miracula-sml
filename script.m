@@ -9,6 +9,3 @@ x = fib (3+1)
 add4 n  = n+3
 
 y = [1..1000]
-
-foldl f z []     = z
-foldl f z (x:xs) = foldl f (f z x) xs
