@@ -259,15 +259,39 @@ fun parse tokens =
                 TOK_INT n => (consume (); Int n)
               | TOK_VAR x => (consume (); Var x)
               | TOK_LPAREN =>
-                if peek2 () = SOME TOK_COLON andalso peek3 () = SOME TOK_RPAREN then
-                    (consume (); consume (); consume ();
-                     Lam ("x", Lam ("y", Cons (Var "x", Var "y"))))
-                else if peek2 () = SOME TOK_ADD andalso peek3 () = SOME TOK_RPAREN then
-                    (consume (); consume (); consume ();
-                     Lam ("x", Lam ("y", Add (Var "x", Var "y"))))
-                else if peek2 () = SOME TOK_SUB andalso peek3 () = SOME TOK_RPAREN then
-                    (consume (); consume (); consume ();
-                     Lam ("x", Lam ("y", Sub (Var "x", Var "y"))))
+                if peek2 () = SOME TOK_COLON then
+                    if peek3 () = SOME TOK_RPAREN then
+                        (consume (); consume (); consume ();
+                         Lam ("x", Lam ("y", Cons (Var "x", Var "y"))))
+                    else
+                        (consume (); consume ();
+                         let val e = parse_expr () in
+                             if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
+                             consume ();
+                             Lam ("x", Cons (Var "x", e))
+                         end)
+                else if peek2 () = SOME TOK_ADD then
+                    if peek3 () = SOME TOK_RPAREN then
+                        (consume (); consume (); consume ();
+                         Lam ("x", Lam ("y", Add (Var "x", Var "y"))))
+                    else
+                        (consume (); consume ();
+                         let val e = parse_expr () in
+                             if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
+                             consume ();
+                             Lam ("x", Add (Var "x", e))
+                         end)
+                else if peek2 () = SOME TOK_SUB then
+                    if peek3 () = SOME TOK_RPAREN then
+                        (consume (); consume (); consume ();
+                         Lam ("x", Lam ("y", Sub (Var "x", Var "y"))))
+                    else
+                        (consume (); consume ();
+                         let val e = parse_expr () in
+                             if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
+                             consume ();
+                             Lam ("x", Sub (Var "x", e))
+                         end)
                 else
                     (consume ();
                      let

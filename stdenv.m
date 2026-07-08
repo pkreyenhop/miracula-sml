@@ -7,5 +7,8 @@ reverse = foldl (converse(:)) []
 
 sum = foldl (+) 0
 
+map f x = [f a | a<-x]
+
+
 
 
