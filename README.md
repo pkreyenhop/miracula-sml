@@ -5,10 +5,13 @@ Miracula is a lightweight interpreter and interactive REPL for a lazy functional
 ## Features
 
 - **Lazy Evaluation (Call-by-Need):** Expressions are evaluated only when required using memoized thunks to avoid redundant computation. Includes cycle/infinite loop detection (`Blackhole` exception).
-- **Equation & Pattern Matching Desugaring:** Allows defining functions through multiple equations (pattern matching on integers and variables). The interpreter automatically compiles and desugars these equations into nested conditional and lambda expressions.
-- **Native List Support:** Lists can be defined using standard bracket notation (e.g., `[1, 2, 3]`, `[]`).
-- **Primitive List Operations:** Native list primitives `hd` and `tl` are built into the runtime environment.
+- **Lexical Closures (Lexical Scoping):** First-class environment-capturing closures that support lexical scope for nested curried functions, ensuring outer variable bindings are resolved correctly in recursive/nested calls.
+- **List Pattern Matching & Desugaring:** Allows defining functions through multiple equations with pattern matching on integers, variables, and list patterns (`[]` and `(x:xs)` cons patterns) compiled into conditional decision trees.
+- **Lazy List Ranges:** Dynamic sequence generators using `[e1..e2]` syntax (e.g., `[1..100]`), lazily evaluated step-by-step so that sequences are generated only as they are accessed.
 - **Interactive REPL:** Provides a prompt (`miranda> `) to define variables/functions and evaluate expressions interactively.
+  - **Enhanced Line Editing**: Basic editing via Left/Right arrows, Backspace, Home (Ctrl-A), End (Ctrl-E), and line killing (Ctrl-K).
+  - **Input History**: Navigate past inputs using Up/Down arrow keys, with draft line saving.
+  - **Graceful Fallbacks**: Automatically detects interactive terminal (TTY) status, falling back cleanly for piped script input.
   - `/e` command: Open and edit `script.m` in the terminal using `vi`, reloading all definitions on exit.
   - `/q` command: Exit the REPL.
 
