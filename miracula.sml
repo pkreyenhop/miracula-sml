@@ -123,6 +123,14 @@ fun parse tokens =
         val toks = ref tokens
         fun peek () = List.hd (!toks)
         fun consume () = toks := List.tl (!toks)
+        fun peek2 () =
+            case !toks of
+                _ :: t :: _ => SOME t
+              | _ => NONE
+        fun peek3 () =
+            case !toks of
+                _ :: _ :: t :: _ => SOME t
+              | _ => NONE
 
         fun parse_expr () =
             case peek () of
@@ -176,12 +184,16 @@ fun parse tokens =
                 TOK_INT n => (consume (); Int n)
               | TOK_VAR x => (consume (); Var x)
               | TOK_LPAREN =>
-                (consume ();
-                 let val e = parse_expr () in
-                     if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
-                     consume ();
-                     e
-                 end)
+                if peek2 () = SOME TOK_COLON andalso peek3 () = SOME TOK_RPAREN then
+                    (consume (); consume (); consume ();
+                     Lam ("x", Lam ("y", Cons (Var "x", Var "y"))))
+                else
+                    (consume ();
+                     let val e = parse_expr () in
+                         if peek () <> TOK_RPAREN then raise Fail "Expected ')'" else ();
+                         consume ();
+                         e
+                     end)
               | TOK_LBRACK => (consume (); parse_list_elements ())
               | _ => raise Fail "Unexpected token inside atom expression"
 
@@ -259,7 +271,21 @@ fun whnf (env : env) (n : node) : node =
         Int n => Int n
       | Lam (x, body) => Closure (x, body, env)
       | Closure (x, body, closure_env) => Closure (x, body, closure_env)
-      | Cons (h, t) => Cons (h, t)
+      | Cons (h, t) =>
+        let
+            fun needs_thunk (Var _) = true
+              | needs_thunk (App _) = true
+              | needs_thunk (Sub _) = true
+              | needs_thunk (Add _) = true
+              | needs_thunk (IfZero _) = true
+              | needs_thunk (IfNil _) = true
+              | needs_thunk (Range _) = true
+              | needs_thunk _ = false
+            val h' = if needs_thunk h then Thunk (ref (Unevaluated (h, env))) else h
+            val t' = if needs_thunk t then Thunk (ref (Unevaluated (t, env))) else t
+        in
+            Cons (h', t')
+        end
       | Nil => Nil
       | Var x =>
         if x = "hd" orelse x = "tl" then Var x
@@ -355,9 +381,9 @@ fun print_node env node =
         let
             fun collect elements current =
                 case whnf env current of
-                    Cons (h, t) => collect (print_node env h :: elements) t
+                    Cons (h, t) => collect (print_node env (whnf env h) :: elements) t
                   | Nil => List.rev elements
-                  | rest => List.rev (print_node env rest :: elements)
+                  | rest => List.rev (print_node env (whnf env rest) :: elements)
         in
             "[" ^ String.concatWith "," (collect [] node) ^ "]"
         end
