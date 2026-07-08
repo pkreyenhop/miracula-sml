@@ -5,4 +5,7 @@ converse f a b = f b a
 
 reverse = foldl (converse(:)) []
 
+sum = foldl (+) 0
+
+
 

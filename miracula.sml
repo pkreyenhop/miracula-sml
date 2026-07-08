@@ -187,6 +187,12 @@ fun parse tokens =
                 if peek2 () = SOME TOK_COLON andalso peek3 () = SOME TOK_RPAREN then
                     (consume (); consume (); consume ();
                      Lam ("x", Lam ("y", Cons (Var "x", Var "y"))))
+                else if peek2 () = SOME TOK_ADD andalso peek3 () = SOME TOK_RPAREN then
+                    (consume (); consume (); consume ();
+                     Lam ("x", Lam ("y", Add (Var "x", Var "y"))))
+                else if peek2 () = SOME TOK_SUB andalso peek3 () = SOME TOK_RPAREN then
+                    (consume (); consume (); consume ();
+                     Lam ("x", Lam ("y", Sub (Var "x", Var "y"))))
                 else
                     (consume ();
                      let val e = parse_expr () in
