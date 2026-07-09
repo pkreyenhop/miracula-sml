@@ -1243,7 +1243,7 @@ fun addHistory (line, history) =
             [] => [line]
           | h :: _ => if h = line then history else line :: history
 
-fun repl (env : env, history : string list) =
+fun repl (env : env, history : string list, script_file : string) =
     case readLine "miranda> " history of
         NONE => print "Goodbye.\n"
       | SOME line =>
@@ -1255,14 +1255,14 @@ fun repl (env : env, history : string list) =
                 print "Goodbye.\n"
             else if line_trimmed = "/e" then
                 let
-                    val _ = print "Opening vi script.m ...\n"
-                    val _ = OS.Process.system "vi script.m"
-                    val _ = print "Reloading environment profiles from script.m...\n"
+                    val _ = print ("Opening vi " ^ script_file ^ " ...\n")
+                    val _ = OS.Process.system ("vi " ^ script_file)
+                    val _ = print ("Reloading environment profiles from " ^ script_file ^ "...\n")
                     val env_with_std = load_script_file "stdenv.m" StringMap.empty
-                    val reloaded_env = load_script_file "script.m" env_with_std
-                in repl (reloaded_env, history) end
+                    val reloaded_env = load_script_file script_file env_with_std
+                in repl (reloaded_env, history, script_file) end
             else if is_empty line_trimmed then
-                repl (env, history)
+                repl (env, history, script_file)
             else
                 let
                     val updated_history = addHistory (line_trimmed, history)
@@ -1275,7 +1275,7 @@ fun repl (env : env, history : string list) =
                              val updated_env = StringMap.insert (env, fname, final_lambda)
                          in
                              print ("Defined variable: " ^ fname ^ "\n");
-                             repl (updated_env, updated_history)
+                             repl (updated_env, updated_history, script_file)
                          end
                        | REPLEval expr =>
                          let
@@ -1286,27 +1286,33 @@ fun repl (env : env, history : string list) =
                          in
                              print ("Result: " ^ result_str ^ "\n");
                              print ("Evaluation time: " ^ LargeInt.toString duration ^ " ms\n");
-                             repl (env, updated_history)
+                             repl (env, updated_history, script_file)
                          end)
                     handle
-                        Fail msg => (print ("Lex/Parse Error: " ^ msg ^ "\n"); repl (env, updated_history))
-                      | Blackhole msg => (print ("Runtime Error: " ^ msg ^ "\n"); repl (env, updated_history))
-                      | RuntimeError msg => (print ("Runtime Error: " ^ msg ^ "\n"); repl (env, updated_history))
-                      | exn => (print ("Error: " ^ General.exnMessage exn ^ "\n"); repl (env, updated_history))
+                        Fail msg => (print ("Lex/Parse Error: " ^ msg ^ "\n"); repl (env, updated_history, script_file))
+                      | Blackhole msg => (print ("Runtime Error: " ^ msg ^ "\n"); repl (env, updated_history, script_file))
+                      | RuntimeError msg => (print ("Runtime Error: " ^ msg ^ "\n"); repl (env, updated_history, script_file))
+                      | exn => (print ("Error: " ^ General.exnMessage exn ^ "\n"); repl (env, updated_history, script_file))
                 end
         end
 
 fun main () =
     let
-        val _ = print "==================================================\n"
-        val _ = print " Environment-Sharing SML REPL                     \n"
-        val _ = print " Use '/e' to edit script.m, '/q' to exit          \n"
-        val _ = print "==================================================\n"
-        (* val _ = CM.make "$smlnj-lib.cm" (* Force dynamic instantiation *) *)
+        val args = CommandLine.arguments ()
+        val script_file = case args of
+                              [] => "script.m"
+                            | [f] => f
+                            | _ => (print "Usage: miracula [script_file]\n"; OS.Process.exit OS.Process.failure)
+        val _ = if script_file = "script.m" then
+                    (print "==================================================\n";
+                     print " Environment-Sharing SML REPL                     \n";
+                     print " Use '/e' to edit script.m, '/q' to exit          \n";
+                     print "==================================================\n")
+                else ()
         val env_with_std = load_script_file "stdenv.m" StringMap.empty
-        val initial_env = load_script_file "script.m" env_with_std
+        val initial_env = load_script_file script_file env_with_std
     in
-        repl (initial_env, [])
+        repl (initial_env, [], script_file)
     end
 
 val _ = main ()

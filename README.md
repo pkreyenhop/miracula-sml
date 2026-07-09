@@ -80,8 +80,19 @@ mlton miracula.mlb
 ```
 
 ### Run
+
 Launch the REPL by running the compiled executable:
 ```bash
-./miracula
+./miracula [script_file]
 ```
-If a `script.m` file is present in the working directory, its bindings will be automatically loaded upon startup.
+If no script file argument is provided, the interpreter defaults to loading `script.m` if present. For a demonstration of all language features, you can run:
+```bash
+./miracula features.m
+```
+
+### Test
+
+You can run the automated verification test suite containing 26 test cases via:
+```bash
+make test
+```

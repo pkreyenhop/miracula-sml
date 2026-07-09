@@ -1,4 +1,6 @@
-miracula:
+miracula: miracula.sml miracula.mlb
 	mlton miracula.mlb
 clean:
-	rm ./miracula
+	rm -f ./miracula
+test: miracula
+	./test_runner.sh
