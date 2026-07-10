@@ -1835,10 +1835,19 @@ fun repl (env : env, history : string list, script_file : string) =
                          let
                              val start = Time.now ()
                              val result = whnf env expr
-                             val result_str = print_node env result
                              val duration = Time.toMilliseconds (Time.- (Time.now (), start))
+                             fun check_string current acc =
+                                 case whnf env current of
+                                     Nil => SOME (String.implode (List.rev acc))
+                                   | Cons (h, t) =>
+                                     (case whnf env h of
+                                          Char c => check_string t (c :: acc)
+                                        | _ => NONE)
+                                   | _ => NONE
                          in
-                             print ("Result: " ^ result_str ^ "\n");
+                             (case check_string result [] of
+                                  SOME s => (print ("Result:\n" ^ s); if String.size s > 0 andalso String.sub(s, String.size s - 1) = #"\n" then () else print "\n")
+                                | NONE => print ("Result: " ^ print_node env result ^ "\n"));
                              print ("Evaluation time: " ^ LargeInt.toString duration ^ " ms\n");
                              repl (env, updated_history, script_file)
                          end)
