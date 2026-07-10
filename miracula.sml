@@ -1879,24 +1879,16 @@ fun main () =
                      print " Environment-Sharing SML REPL                     \n";
                      print " Use '/e' to edit script.m, '/q' to exit          \n";
                      print "==================================================\n")
-                else ()
+                else
+                    (print "==================================================\n";
+                     print (" Loaded file: " ^ script_file ^ "                  \n");
+                     print (" Use '/e' to edit " ^ script_file ^ ", '/q' to exit\n");
+                     print "==================================================\n")
         val env_with_std = load_script_file "stdenv.m" StringMap.empty
         val initial_env = load_script_file script_file env_with_std
 
     in
-        if is_repl_mode then
-            repl (initial_env, [], script_file)
-        else
-            (case StringMap.find (initial_env, "main") of
-                 SOME main_node =>
-                 let
-                     val result = whnf initial_env main_node
-                     val _ = print_output_node initial_env result
-                 in
-                     OS.Process.exit OS.Process.success
-                 end
-               | NONE =>
-                 repl (initial_env, [], script_file))
+        repl (initial_env, [], script_file)
     end
     handle RuntimeError msg => (print ("Runtime Error: " ^ msg ^ "\n"); OS.Process.exit OS.Process.failure)
          | Fail msg => (print ("Error: " ^ msg ^ "\n"); OS.Process.exit OS.Process.failure)
