@@ -76,9 +76,7 @@ for ((i=0; i<total; i++)); do
   expr="${exprs[$i]}"
   expected="${expecteds[$i]}"
   
-  # Run the expression in miracula using features.m
-  # We extract the Result line using grep
-  output=$(echo "$expr" | ./miracula features.m 2>/dev/null | grep -oP "Result:\s*\K.*")
+  output=$(echo "$expr" | ./miracula features.m 2>/dev/null | sed -n 's/.*Result:[[:space:]]*//p')
   
   # Strip trailing/leading spaces
   output=$(echo "$output" | xargs)

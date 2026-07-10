@@ -20,6 +20,7 @@ and node =
     Int of int
   | Var of string
   | Lam of string * node
+  | Let of (string * node) list * node
   | App of node * node
   | Sub of node * node
   | Add of node * node
@@ -42,6 +43,8 @@ and node =
   | Tuple of node list
   | If of node * node * node
   | Append of node * node
+  | Div of node * node
+  | Diff of node * node
   | ZFGenerator of parsed_pattern * qualifier list * node * node * (node StringMap.map)
   | ZF of node * qualifier list
   | Proj of int * node
@@ -80,6 +83,8 @@ datatype token =
   | TOK_EQ | TOK_NE | TOK_LT | TOK_GT | TOK_LE | TOK_GE
   | TOK_MOD | TOK_IF
   | TOK_CHAR of char | TOK_STRING of string | TOK_PP
+  | TOK_WHERE | TOK_LBRACE | TOK_RBRACE | TOK_HASH
+  | TOK_DIV | TOK_AND | TOK_OR | TOK_DIFF
 
 local
     fun isDigit c = Char.isDigit c
@@ -93,7 +98,10 @@ in
                 else
                     let val c = String.sub(str, i) in
                         if Char.isSpace c then loop (i + 1) acc
-                        else if c = #"\\" then loop (i + 1) (TOK_LAMBDA :: acc)
+                        else if c = #"\\" then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"/"
+                            then loop (i + 2) (TOK_OR :: acc)
+                            else loop (i + 1) (TOK_LAMBDA :: acc)
                         else if c = #"."  then
                             if i + 1 < size andalso String.sub(str, i+1) = #"."
                             then loop (i + 2) (TOK_DOTDOT :: acc)
@@ -104,7 +112,10 @@ in
                         else if c = #"]"  then loop (i + 1) (TOK_RBRACK :: acc)
                         else if c = #","  then loop (i + 1) (TOK_COMMA :: acc)
                         else if c = #";"  then loop (i + 1) (TOK_SEMICOLON :: acc)
-                        else if c = #"|"  then loop (i + 1) (TOK_PIPE :: acc)
+                        else if c = #"|"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"|"
+                            then List.rev (TOK_EOF :: acc)
+                            else loop (i + 1) (TOK_PIPE :: acc)
                         else if c = #"<"  then
                             if i + 1 < size andalso String.sub(str, i+1) = #"-"
                             then loop (i + 2) (TOK_LARROW :: acc)
@@ -123,8 +134,15 @@ in
                             if i + 1 < size andalso String.sub(str, i+1) = #"="
                             then loop (i + 2) (TOK_NE :: acc)
                             else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
+                        else if c = #"~"  then
+                            if i + 1 < size andalso String.sub(str, i+1) = #"="
+                            then loop (i + 2) (TOK_NE :: acc)
+                            else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
+                        else if c = #"/"  then loop (i + 1) (TOK_DIV :: acc)
+                        else if c = #"&"  then loop (i + 1) (TOK_AND :: acc)
                         else if c = #"*"  then loop (i + 1) (TOK_MUL :: acc)
                         else if c = #":"  then loop (i + 1) (TOK_COLON :: acc)
+                        else if c = #"#"  then loop (i + 1) (TOK_HASH :: acc)
                         else if c = #"+"  then
                             if i + 1 < size andalso String.sub(str, i+1) = #"+"
                             then loop (i + 2) (TOK_PP :: acc)
@@ -132,6 +150,8 @@ in
                         else if c = #"-"  then
                             if i + 1 < size andalso String.sub(str, i+1) = #">"
                             then loop (i + 2) (TOK_ARROW :: acc)
+                            else if i + 1 < size andalso String.sub(str, i+1) = #"-"
+                            then loop (i + 2) (TOK_DIFF :: acc)
                             else loop (i + 1) (TOK_SUB :: acc)
                         else if c = #"'" then
                             if i + 2 < size andalso String.sub(str, i+1) <> #"\\" andalso String.sub(str, i+2) = #"'" then
@@ -196,6 +216,7 @@ in
                                             | "then"   => TOK_THEN
                                             | "else"   => TOK_ELSE
                                             | "mod"    => TOK_MOD
+                                            | "where"  => TOK_WHERE
                                             | _        => TOK_VAR s
                             in loop nextJ (tok :: acc) end
                         else (print ("Lex error: char " ^ String.str c ^ "\n"); loop (i+1) acc)
@@ -212,6 +233,78 @@ end
 type raw_binding = { fname: string, pats: parsed_pattern list, body: node }
 datatype stmt = ScriptBind of raw_binding | REPLEval of node
 
+val var_counter = ref 0
+fun new_var_name prefix =
+    let
+        val c = !var_counter
+        val _ = var_counter := c + 1
+    in
+        prefix ^ "_" ^ Int.toString c
+    end
+
+fun desugar_equations (eqs : raw_binding list) : node =
+    case eqs of
+        [] => raise Fail "Empty equation sequence"
+      | [ ({ pats = [], body, ... } : raw_binding) ] => body
+      | [ ({ pats = [PatVar x], body, ... } : raw_binding) ] => Lam (x, body)
+      | _ =>
+        let
+            val { pats = first_pats, ... } = List.hd eqs
+            val arity = List.length first_pats
+            val _ = if List.exists (fn ({pats, ...} : raw_binding) => List.length pats <> arity) eqs 
+                    then raise Fail "Equations have mismatched parameter arities" else ()
+            
+            fun make_param_names 0 acc = acc
+              | make_param_names n acc = make_param_names (n-1) (("p" ^ Int.toString (n-1)) :: acc)
+            val param_names = make_param_names arity []
+
+            fun build_decision_tree [] = MatchError
+              | build_decision_tree (({pats, body, ...} : raw_binding) :: rest) =
+                let
+                    fun check_pats [] [] tree_body = tree_body
+                      | check_pats (p::p_rest) (pat::pat_rest) tree_body =
+                        (case pat of
+                             PatInt target_val =>
+                             IfZero (Sub (Var p, Int target_val), check_pats p_rest pat_rest tree_body, build_decision_tree rest)
+                           | PatChar target_val =>
+                             IfZero (Sub (Eq (Var p, Char target_val), Int 1), check_pats p_rest pat_rest tree_body, build_decision_tree rest)
+                           | PatVar binding_name =>
+                             let val substituted_body = 
+                                     if binding_name = p then tree_body
+                                     else App (Lam (binding_name, tree_body), Var p)
+                             in check_pats p_rest pat_rest substituted_body end
+                           | PatTuple tuple_pats =>
+                             let
+                                 val elms_vars = List.tabulate (List.length tuple_pats, fn i => new_var_name ("t" ^ Int.toString i))
+                                 val inner_body = check_pats (elms_vars @ p_rest) (tuple_pats @ pat_rest) tree_body
+                                 fun wrap_projs [] _ body = body
+                                   | wrap_projs (var :: rest_vars) i body =
+                                     App (Lam (var, wrap_projs rest_vars (i+1) body), Proj (i, Var p))
+                             in
+                                 wrap_projs elms_vars 0 inner_body
+                             end
+                           | PatNil =>
+                             IfNil (Var p, check_pats p_rest pat_rest tree_body, build_decision_tree rest)
+                           | PatCons (head_pat, tail_pat) =>
+                             let
+                                 val h_var = new_var_name "h"
+                                 val t_var = new_var_name "t"
+                                 val failure_branch = build_decision_tree rest
+                                 val inner_body = check_pats (h_var :: t_var :: p_rest) (head_pat :: tail_pat :: pat_rest) tree_body
+                                 in
+                                 IfNil (Var p,
+                                        failure_branch,
+                                        App (Lam (h_var,
+                                                  App (Lam (t_var, inner_body),
+                                                       App (Var "tl", Var p))),
+                                              App (Var "hd", Var p)))
+                             end)
+                      | check_pats _ _ _ = raise Fail "Internal pattern arity violation"
+                in check_pats param_names pats body end
+
+            val decision_tree = build_decision_tree eqs
+        in List.foldr (fn (p, acc) => Lam (p, acc)) decision_tree param_names end
+
 fun parse tokens =
     let
         val toks = ref tokens
@@ -227,35 +320,99 @@ fun parse tokens =
               | _ => NONE
 
         fun parse_expr () =
-            case peek () of
-                TOK_LAMBDA =>
-                (consume ();
-                 case peek () of
-                     TOK_VAR x =>
-                     (consume ();
-                      if peek () <> TOK_DOT then raise Fail "Expected '.' after lambda variable" else ();
-                      consume ();
-                      Lam (x, parse_expr ()))
-                   | _ => raise Fail "Expected variable after lambda '\\'")
-              | TOK_IFZERO =>
-                (consume ();
-                 let
-                     val cond = parse_expr ()
-                     val _ = if peek () <> TOK_THEN then raise Fail "Expected 'then'" else consume ()
-                     val t_branch = parse_expr ()
-                     val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
-                     val f_branch = parse_expr ()
-                 in IfZero (cond, t_branch, f_branch) end)
-              | TOK_IF =>
-                (consume ();
-                 let
-                     val cond = parse_expr ()
-                     val _ = if peek () <> TOK_THEN then raise Fail "Expected 'then'" else consume ()
-                     val t_branch = parse_expr ()
-                     val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
-                     val f_branch = parse_expr ()
-                 in If (cond, t_branch, f_branch) end)
-              | _ => parse_cons ()
+            let
+                val e = case peek () of
+                            TOK_LAMBDA =>
+                            (consume ();
+                             case peek () of
+                                 TOK_VAR x =>
+                                 (consume ();
+                                  if peek () <> TOK_DOT then raise Fail "Expected '.' after lambda variable" else ();
+                                  consume ();
+                                  Lam (x, parse_expr ()))
+                               | _ => raise Fail "Expected variable after lambda '\\'")
+                          | TOK_IFZERO =>
+                            (consume ();
+                             let
+                                 val cond = parse_expr ()
+                                 val _ = if peek () <> TOK_THEN then raise Fail "Expected 'then'" else consume ()
+                                 val t_branch = parse_expr ()
+                                 val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
+                                 val f_branch = parse_expr ()
+                             in IfZero (cond, t_branch, f_branch) end)
+                          | TOK_IF =>
+                            (consume ();
+                             let
+                                 val cond = parse_expr ()
+                                 val _ = if peek () <> TOK_THEN then raise Fail "Expected 'then'" else consume ()
+                                 val t_branch = parse_expr ()
+                                 val _ = if peek () <> TOK_ELSE then raise Fail "Expected 'else'" else consume ()
+                                 val f_branch = parse_expr ()
+                             in If (cond, t_branch, f_branch) end)
+                          | _ => parse_or ()
+            in
+                case peek () of
+                    TOK_WHERE =>
+                    (consume ();
+                     if peek () <> TOK_LBRACE then raise Fail "Expected '{' after 'where'" else ();
+                     consume ();
+                     let
+                         fun parse_bindings () =
+                             if peek () = TOK_RBRACE then
+                                 (consume (); [])
+                             else
+                                 let
+                                     val b = if is_assignment (!toks) then
+                                                 case peek () of
+                                                     TOK_VAR name =>
+                                                     (consume ();
+                                                      let
+                                                          fun collect_patterns acc =
+                                                              if peek () = TOK_ASSIGN then (consume (); List.rev acc)
+                                                              else collect_patterns (parse_pattern () :: acc)
+                                                          val pats = collect_patterns []
+                                                          val expr_body = parse_expr ()
+                                                      in { fname = name, pats = pats, body = expr_body } end)
+                                                   | _ => raise Fail "Left hand side of local binding must start with an identifier"
+                                             else
+                                                 raise Fail "Expected local binding in where clause"
+                                     val rest = if peek () = TOK_SEMICOLON then
+                                                    (consume (); parse_bindings ())
+                                                else if peek () = TOK_RBRACE then
+                                                    (consume (); [])
+                                                else
+                                                    raise Fail "Expected ';' or '}' in where bindings"
+                                 in
+                                     b :: rest
+                                 end
+                         val bs = parse_bindings ()
+                         
+                         fun update_group (b as {fname, ...}, m) =
+                             let val current = case StringMap.find (m, fname) of SOME l => l | NONE => []
+                             in StringMap.insert (m, fname, current @ [b]) end
+                         val grouped = List.foldl update_group StringMap.empty bs
+                         val desugared_bindings = StringMap.foldli (fn (fname, eq_list, acc) =>
+                             (fname, desugar_equations eq_list) :: acc
+                         ) [] grouped
+                     in
+                         Let (desugared_bindings, e)
+                     end)
+                  | _ => e
+            end
+
+        and parse_or () =
+            let val left = parse_and () in
+                case peek () of
+                    TOK_OR => (consume (); If (left, Int 1, parse_or ()))
+                  | _ => left
+            end
+
+        and parse_and () =
+            let val left = parse_cons () in
+                case peek () of
+                    TOK_AND => (consume (); If (left, parse_and (), Int 0))
+                  | _ => left
+            end
 
         and parse_cons () =
             let val left = parse_pp () in
@@ -268,6 +425,7 @@ fun parse tokens =
             let val left = parse_comp () in
                 case peek () of
                     TOK_PP => (consume (); Append (left, parse_pp ()))
+                  | TOK_DIFF => (consume (); Diff (left, parse_pp ()))
                   | _ => left
             end
 
@@ -292,10 +450,25 @@ fun parse tokens =
             in loop (parse_mod ()) end
 
         and parse_mod () =
+            let fun loop left =
+                case peek () of
+                    TOK_MOD => (consume (); loop (Mod (left, parse_compose ())))
+                  | TOK_MUL => (consume (); loop (Mul (left, parse_compose ())))
+                  | TOK_DIV => (consume (); loop (Div (left, parse_compose ())))
+                  | _ => left
+            in loop (parse_compose ()) end
+
+        and parse_compose () =
             let val left = parse_app () in
                 case peek () of
-                    TOK_MOD => (consume (); Mod (left, parse_app ()))
-                  | TOK_MUL => (consume (); Mul (left, parse_app ()))
+                    TOK_DOT =>
+                    (consume ();
+                     let
+                         val right = parse_compose ()
+                         val var = new_var_name "cx"
+                     in
+                         Lam (var, App (left, App (right, Var var)))
+                     end)
                   | _ => left
             end
 
@@ -313,7 +486,8 @@ fun parse tokens =
 
         and parse_atom () =
             case peek () of
-                TOK_INT n => (consume (); Int n)
+                TOK_HASH => (consume (); App (Var "length", parse_atom ()))
+              | TOK_INT n => (consume (); Int n)
               | TOK_CHAR c => (consume (); Char c)
               | TOK_STRING s =>
                 let
@@ -378,6 +552,7 @@ fun parse tokens =
                               consume ();
                               first)
                      end)
+              | TOK_SUB => (consume (); Sub (Int 0, parse_atom ()))
               | TOK_LBRACK => (consume (); parse_list_elements ())
               | _ => raise Fail "Unexpected token inside atom expression"
 
@@ -434,6 +609,8 @@ fun parse tokens =
 
         and is_assignment ts =
             let fun check [] = false
+                  | check (TOK_SEMICOLON :: _) = false
+                  | check (TOK_RBRACE :: _) = false
                   | check (TOK_ASSIGN :: _) = true
                   | check (_ :: rest) = check rest
             in check ts end
@@ -550,12 +727,63 @@ and eval_zf env body_expr qualifiers =
       | Generator (pat, src) :: rest =>
         ZFGenerator (pat, rest, src, body_expr, env)
 
+and get_string_value env node =
+    let
+        fun collect current acc =
+            case whnf env current of
+                Nil => String.implode (List.rev acc)
+              | Cons (h, t) =>
+                (case whnf env h of
+                     Char c => collect t (c :: acc)
+                   | _ => raise RuntimeError "Expected char in string")
+              | _ => raise RuntimeError "Expected string"
+    in
+        collect node []
+    end
+
+and make_string_node s =
+    let
+        fun make [] = Nil
+          | make (c :: cs) = Cons (Char c, make cs)
+    in
+        make (String.explode s)
+    end
+
+and read_file_content filename =
+    let
+        val instream = TextIO.openIn filename
+        fun read_all acc =
+            case TextIO.inputLine instream of
+                NONE => (TextIO.closeIn instream; String.concat (List.rev acc))
+              | SOME line => read_all (line :: acc)
+    in
+        read_all []
+    end handle _ => raise RuntimeError ("Failed to read file: " ^ filename)
+
 and whnf (env : env) (n : node) : node =
     case n of
         Int n => Int n
       | Char c => Char c
       | Lam (x, body) => Closure (x, body, env)
       | Closure (x, body, closure_env) => Closure (x, body, closure_env)
+      | Let (bindings, body) =>
+        let
+            val dummy_env = StringMap.empty
+            val env' = List.foldl (fn ((x_i, e_i), acc) =>
+                let
+                    val r = ref (Unevaluated (e_i, dummy_env))
+                in
+                    StringMap.insert (acc, x_i, Thunk r)
+                end
+            ) env bindings
+            val _ = List.app (fn (x_i, e_i) =>
+                case StringMap.find (env', x_i) of
+                    SOME (Thunk r) => r := Unevaluated (e_i, env')
+                  | _ => ()
+            ) bindings
+        in
+            whnf env' body
+        end
       | Cons (h, t) =>
         let
             fun needs_thunk (Int _) = false
@@ -565,7 +793,6 @@ and whnf (env : env) (n : node) : node =
               | needs_thunk (Closure _) = false
               | needs_thunk (Lam _) = false
               | needs_thunk (Cons _) = false
-              | needs_thunk (Tuple _) = false
               | needs_thunk MatchError = false
               | needs_thunk _ = true
             val h' = if needs_thunk h then Thunk (ref (Unevaluated (h, env))) else h
@@ -578,11 +805,32 @@ and whnf (env : env) (n : node) : node =
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => if n1 = n2 then Int 1 else Int 0
            | (Char c1, Char c2) => if c1 = c2 then Int 1 else Int 0
-           | _ => raise RuntimeError "Equality expects integers or characters")
+           | (Nil, Nil) => Int 1
+           | (Cons (h1, t1), Cons (h2, t2)) =>
+             (case whnf env (Eq (h1, h2)) of
+                  Int 1 => whnf env (Eq (t1, t2))
+                | _ => Int 0)
+           | (Nil, Cons _) => Int 0
+           | (Cons _, Nil) => Int 0
+           | (Tuple elms1, Tuple elms2) =>
+             if List.length elms1 = List.length elms2 then
+                 let
+                     fun check_elms [] [] = Int 1
+                       | check_elms (x :: xs) (y :: ys) =
+                         (case whnf env (Eq (x, y)) of
+                              Int 1 => check_elms xs ys
+                            | _ => Int 0)
+                       | check_elms _ _ = Int 0
+                 in
+                     check_elms elms1 elms2
+                 end
+             else Int 0
+           | (other1, other2) => raise RuntimeError ("Equality expects integers, characters, lists or tuples, got: " ^ print_node env other1 ^ " and " ^ print_node env other2))
       | Ne (e1, e2) =>
-        (case (whnf env e1, whnf env e2) of
-             (Int n1, Int n2) => if n1 <> n2 then Int 1 else Int 0
-           | _ => raise RuntimeError "Inequality expects integers")
+        (case whnf env (Eq (e1, e2)) of
+             Int 1 => Int 0
+           | Int 0 => Int 1
+           | _ => raise RuntimeError "Inequality expects boolean result from equality")
       | Lt (e1, e2) =>
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => if n1 < n2 then Int 1 else Int 0
@@ -623,7 +871,22 @@ and whnf (env : env) (n : node) : node =
         (case whnf env cond of
              Int 0 => whnf env f_branch
            | Int _ => whnf env t_branch
-           | _ => raise RuntimeError "If condition must be an integer")
+           | other =>
+             let
+                 val test_name = case StringMap.find (env, "name") of
+                                     SOME n => print_node env (whnf env n)
+                                   | NONE => "<unknown>"
+                 val cond_ast = case StringMap.find (env, "cond") of
+                                    SOME (Thunk r) =>
+                                    (case !r of
+                                         Unevaluated (expr, _) => print_node env expr
+                                       | Evaluated n => print_node env n
+                                       | Evaluating => "<evaluating>")
+                                  | SOME n => print_node env n
+                                  | NONE => "<none>"
+             in
+                 raise RuntimeError ("In test '" ^ test_name ^ "': If condition must be an integer, got: " ^ print_node env other ^ " for condition expression AST: " ^ cond_ast)
+             end)
       | Append (e1, e2) =>
         (case whnf env e1 of
              Nil => whnf env e2
@@ -656,7 +919,7 @@ and whnf (env : env) (n : node) : node =
              end
              | _ => raise RuntimeError "Generator source must be a list")
       | Var x =>
-        if x = "hd" orelse x = "tl" then Var x
+        if x = "hd" orelse x = "tl" orelse x = "show" orelse x = "read" orelse x = "lines" orelse x = "numval" orelse x = "length" then Var x
         else
             (case StringMap.find (env, x) of
                   SOME (Thunk r) =>
@@ -670,7 +933,7 @@ and whnf (env : env) (n : node) : node =
                             result
                         end))
                 | SOME explicit_node => whnf env explicit_node
-                | NONE => raise RuntimeError ("Unbound variable: " ^ x))
+                | NONE => raise RuntimeError ("Unbound variable: " ^ x ^ ", environment keys: " ^ String.concatWith ", " (StringMap.foldri (fn (k, _, acc) => k :: acc) [] env)))
       | App (e1, e2) =>
         (case whnf env e1 of
              Var "hd" =>
@@ -683,6 +946,59 @@ and whnf (env : env) (n : node) : node =
                   Cons (_, t) => whnf env t
                 | Nil => raise RuntimeError "tl applied to empty list"
                 | _ => raise RuntimeError "tl expects a list")
+           | Var "read" =>
+             let
+                 val filename = get_string_value env e2
+                 val content = read_file_content filename
+             in
+                 make_string_node content
+             end
+           | Var "lines" =>
+             let
+                 val content = get_string_value env e2
+                 fun split_lines s =
+                     let
+                         val fields = String.fields (fn c => c = #"\n") s
+                         val fields' =
+                             case List.rev fields of
+                                 "" :: rest => List.rev rest
+                               | _ => fields
+                     in
+                         fields'
+                     end
+                 val str_list = split_lines content
+                 fun make_node_list [] = Nil
+                   | make_node_list (str :: strs) = Cons (make_string_node str, make_node_list strs)
+             in
+                 make_node_list str_list
+             end
+           | Var "numval" =>
+             let
+                 val s = get_string_value env e2
+                 val s_trimmed = String.translate (fn c => if Char.isSpace c then "" else String.str c) s
+                 val v = case Int.fromString s_trimmed of
+                             SOME n => n
+                           | NONE => raise RuntimeError ("numval: invalid integer: " ^ s)
+             in
+                 Int v
+             end
+           | Var "show" =>
+             let
+                 val evaluated_node = whnf env e2
+                 val s = print_node env evaluated_node
+             in
+                 make_string_node s
+             end
+           | Var "length" =>
+             let
+                 fun len list_node =
+                     case whnf env list_node of
+                         Nil => 0
+                       | Cons (_, t) => 1 + len t
+                       | _ => raise RuntimeError "length expects a list"
+             in
+                 Int (len e2)
+             end
            | Closure (x, body, closure_env) =>
               let
                   val shared_thunk = Thunk (ref (Unevaluated (e2, env)))
@@ -706,6 +1022,43 @@ and whnf (env : env) (n : node) : node =
         (case (whnf env e1, whnf env e2) of
              (Int n1, Int n2) => Int (n1 * n2)
            | _ => raise RuntimeError "Multiplication expects integers")
+      | Div (e1, e2) =>
+        (case (whnf env e1, whnf env e2) of
+             (Int n1, Int n2) =>
+             if n2 = 0 then raise RuntimeError "Division by zero"
+             else Int (n1 div n2)
+           | _ => raise RuntimeError "Division expects integers")
+      | Diff (e1, e2) =>
+        let
+            val xs = whnf env e1
+            val ys = whnf env e2
+            
+            fun remove_one x list_node =
+                case whnf env list_node of
+                    Nil => Nil
+                  | Cons (h, t) =>
+                    (case whnf env (Eq (x, h)) of
+                         Int 1 => t
+                       | _ =>
+                         let
+                             val t_eval = remove_one x t
+                         in
+                             Cons (h, t_eval)
+                         end)
+                  | _ => raise RuntimeError "-- expects lists"
+
+            fun diff list_xs Nil = list_xs
+              | diff list_xs (Cons (y, ys')) =
+                let
+                    val y_eval = whnf env y
+                    val xs' = remove_one y_eval list_xs
+                in
+                    diff xs' (whnf env ys')
+                end
+              | diff _ _ = raise RuntimeError "-- expects lists"
+        in
+            diff xs ys
+        end
       | IfZero (cond, t_branch, f_branch) =>
         (case whnf env cond of
              Int 0 => whnf env t_branch
@@ -738,16 +1091,19 @@ and whnf (env : env) (n : node) : node =
                   result
               end))
 
-fun print_node env node =
+and print_node env node =
     case node of
         Int n => Int.toString n
       | Lam (x, _) => "\\" ^ x ^ ". <closure>"
       | Closure (x, _, _) => "\\" ^ x ^ ". <closure>"
+      | Let _ => "<let>"
       | Var x => x
       | App (e1, e2) => "(" ^ print_node env e1 ^ " " ^ print_node env e2 ^ ")"
       | Sub (e1, e2) => "(" ^ print_node env e1 ^ " - " ^ print_node env e2 ^ ")"
       | Add (e1, e2) => "(" ^ print_node env e1 ^ " + " ^ print_node env e2 ^ ")"
       | Mul (e1, e2) => "(" ^ print_node env e1 ^ " * " ^ print_node env e2 ^ ")"
+      | Div (e1, e2) => "(" ^ print_node env e1 ^ " / " ^ print_node env e2 ^ ")"
+      | Diff (e1, e2) => "(" ^ print_node env e1 ^ " -- " ^ print_node env e2 ^ ")"
       | Eq (e1, e2) => "(" ^ print_node env e1 ^ " == " ^ print_node env e2 ^ ")"
       | Ne (e1, e2) => "(" ^ print_node env e1 ^ " != " ^ print_node env e2 ^ ")"
       | Lt (e1, e2) => "(" ^ print_node env e1 ^ " < " ^ print_node env e2 ^ ")"
@@ -897,10 +1253,18 @@ fun print_ast node =
       | Var x => "Var " ^ x
       | Lam (x, body) => "Lam (" ^ x ^ ", " ^ print_ast body ^ ")"
       | Closure (x, body, _) => "Closure (" ^ x ^ ", " ^ print_ast body ^ ")"
+      | Let (bindings, body) =>
+        let
+            val binds = String.concatWith "," (List.map (fn (x, e) => x ^ "=" ^ print_ast e) bindings)
+        in
+            "Let ([" ^ binds ^ "], " ^ print_ast body ^ ")"
+        end
       | App (e1, e2) => "App (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Sub (e1, e2) => "Sub (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Add (e1, e2) => "Add (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | Mul (e1, e2) => "Mul (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Div (e1, e2) => "Div (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
+      | Diff (e1, e2) => "Diff (" ^ print_ast e1 ^ ", " ^ print_ast e2 ^ ")"
       | IfZero (c, t, f) => "IfZero (" ^ print_ast c ^ ", " ^ print_ast t ^ ", " ^ print_ast f ^ ")"
       | IfNil (c, t, f) => "IfNil (" ^ print_ast c ^ ", " ^ print_ast t ^ ", " ^ print_ast f ^ ")"
       | MatchError => "MatchError"
@@ -926,6 +1290,121 @@ fun load_script_file filename env =
     let
         fun file_exists name =
             let val ins = TextIO.openIn name in TextIO.closeIn ins; true end handle _ => false
+            
+        fun count_indent s =
+            let
+                val chars = String.explode s
+                fun count [] n = n
+                  | count (c::cs) n =
+                    if c = #" " then count cs (n + 1)
+                    else if c = #"\t" then count cs (n + 4)
+                    else n
+            in
+                count chars 0
+            end
+
+        fun has_where [] = false
+          | has_where (TOK_WHERE :: _) = true
+          | has_where (_ :: ts) = has_where ts
+
+        fun apply_layout (lines : (int * token list) list) : token list =
+            let
+                fun token_depth_delta [] = 0
+                  | token_depth_delta (TOK_LPAREN :: ts) = 1 + token_depth_delta ts
+                  | token_depth_delta (TOK_RPAREN :: ts) = ~1 + token_depth_delta ts
+                  | token_depth_delta (TOK_LBRACK :: ts) = 1 + token_depth_delta ts
+                  | token_depth_delta (TOK_RBRACK :: ts) = ~1 + token_depth_delta ts
+                  | token_depth_delta (_ :: ts) = token_depth_delta ts
+
+                fun loop ([], stack, acc, expect_layout, depth) =
+                    let
+                        val closes = List.map (fn _ => TOK_RBRACE) (List.tl stack)
+                    in
+                        List.rev acc @ closes @ [TOK_EOF]
+                    end
+                  | loop ((indent, line_toks) :: rest, stack, acc, expect_layout, depth) =
+                    let
+                        val (stack', acc', expect_layout', just_pushed) =
+                            if expect_layout andalso depth = 0 then
+                                let
+                                    val parent_layout = List.hd stack
+                                    val is_greater = indent > parent_layout
+                                in
+                                    if is_greater then
+                                        (indent :: stack, TOK_LBRACE :: acc, false, true)
+                                    else
+                                        (stack, acc, false, false)
+                                end
+                            else
+                                (stack, acc, false, false)
+
+                        fun close_layouts (s, closed_acc) =
+                            if depth = 0 then
+                                case s of
+                                    [] => ([], closed_acc)
+                                  | [0] => ([0], closed_acc)
+                                  | top :: under =>
+                                    if indent < top then
+                                        close_layouts (under, TOK_RBRACE :: closed_acc)
+                                    else
+                                        (s, closed_acc)
+                            else
+                                (s, closed_acc)
+
+                        val (stack'', close_toks) = close_layouts (stack', [])
+                        val acc'' = close_toks @ acc'
+
+                        val current_layout = List.hd stack''
+                        val acc''' =
+                            if depth = 0 andalso indent = current_layout andalso not (null acc'') andalso not just_pushed then
+                                TOK_SEMICOLON :: acc''
+                            else
+                                acc''
+
+                        val next_expect_layout = if depth = 0 then has_where line_toks else false
+                        val new_acc = List.rev line_toks @ acc'''
+                        
+                        val delta = token_depth_delta line_toks
+                        val new_depth = Int.max (0, depth + delta)
+                    in
+                        loop (rest, stack'', new_acc, next_expect_layout, new_depth)
+                    end
+            in
+                loop (lines, [0], [], false, 0)
+            end
+
+        fun split_tokens tokens =
+            let
+                fun loop ([], current, acc, _) =
+                    if null current then List.rev acc
+                    else List.rev (List.rev (TOK_EOF :: current) :: acc)
+                  | loop (t::ts, current, acc, depth) =
+                    if t = TOK_EOF then
+                        loop (ts, current, acc, depth)
+                    else
+                        let
+                            val new_depth =
+                                case t of
+                                    TOK_LBRACE => depth + 1
+                                  | TOK_LPAREN => depth + 1
+                                  | TOK_LBRACK => depth + 1
+                                  | TOK_RBRACE => depth - 1
+                                  | TOK_RPAREN => depth - 1
+                                  | TOK_RBRACK => depth - 1
+                                  | _ => depth
+                        in
+                            if t = TOK_SEMICOLON andalso depth = 0 then
+                                let
+                                    val segment = List.rev (TOK_EOF :: current)
+                                in
+                                    loop (ts, [], segment :: acc, depth)
+                                end
+                            else
+                                loop (ts, t :: current, acc, new_depth)
+                        end
+            in
+                loop (tokens, [], [], 0)
+            end
     in
         if not (file_exists filename) then
             if filename = "stdenv.m" then
@@ -945,15 +1424,90 @@ fun load_script_file filename env =
                         in
                             if is_empty l orelse (String.size l >= 2 andalso String.substring(l,0,2) = "||")
                             then read_all lines
-                            else read_all (l :: lines)
+                            else read_all (line :: lines)
                         end
                 val raw_lines = read_all []
                 
-                fun process_line line =
-                    case parse (tokenize line) of
+                fun token_to_string t =
+                    case t of
+                        TOK_LAMBDA => "\\"
+                      | TOK_DOT => "."
+                      | TOK_DOTDOT => ".."
+                      | TOK_ARROW => "->"
+                      | TOK_ASSIGN => "="
+                      | TOK_LPAREN => "("
+                      | TOK_RPAREN => ")"
+                      | TOK_LBRACK => "["
+                      | TOK_RBRACK => "]"
+                      | TOK_COMMA => ","
+                      | TOK_COLON => ":"
+                      | TOK_SUB => "-"
+                      | TOK_ADD => "+"
+                      | TOK_MUL => "*"
+                      | TOK_DIV => "/"
+                      | TOK_IFZERO => "ifzero"
+                      | TOK_THEN => "then"
+                      | TOK_ELSE => "else"
+                      | TOK_INT n => Int.toString n
+                      | TOK_VAR s => s
+                      | TOK_EOF => "<EOF>"
+                      | TOK_PIPE => "|"
+                      | TOK_LARROW => "<-"
+                      | TOK_SEMICOLON => ";"
+                      | TOK_EQ => "=="
+                      | TOK_NE => "~="
+                      | TOK_LT => "<"
+                      | TOK_GT => ">"
+                      | TOK_LE => "<="
+                      | TOK_GE => ">="
+                      | TOK_MOD => "mod"
+                      | TOK_IF => "if"
+                      | TOK_CHAR c => "'" ^ String.str c ^ "'"
+                      | TOK_STRING s => "\"" ^ s ^ "\""
+                      | TOK_PP => "++"
+                      | TOK_WHERE => "where"
+                      | TOK_LBRACE => "{"
+                      | TOK_RBRACE => "}"
+                      | TOK_HASH => "#"
+                      | TOK_AND => "&"
+                      | TOK_OR => "\\/"
+                      | TOK_DIFF => "--"
+
+                fun wrap_where_on_line [] = []
+                  | wrap_where_on_line (TOK_WHERE :: ts) =
+                    if null ts then
+                        [TOK_WHERE]
+                    else
+                        TOK_WHERE :: TOK_LBRACE :: wrap_where_on_line ts @ [TOK_RBRACE]
+                  | wrap_where_on_line (t :: ts) = t :: wrap_where_on_line ts
+
+                val parsed_lines = List.map (fn line =>
+                    let
+                        val indent = count_indent line
+                        val trimmed = String.implode (List.filter (fn c => c <> #"\r" andalso c <> #"\n") (String.explode line))
+                        val line_content = String.implode (List.drop (String.explode trimmed, indent))
+                        val line_tokens = List.filter (fn t => t <> TOK_EOF) (tokenize line_content)
+
+                    in
+                        (indent, wrap_where_on_line line_tokens)
+                    end
+                ) raw_lines
+                
+                val parsed_lines' = List.filter (fn (_, ts) => not (null ts)) parsed_lines
+                val file_tokens = apply_layout parsed_lines'
+                val segments = split_tokens file_tokens
+                
+
+
+                fun process_segment segment =
+                    (case parse segment of
                         ScriptBind b => b
-                      | _ => raise Fail "Invalid expression structure in script file"
-                val bindings = List.map process_line raw_lines
+                      | _ => raise Fail "Invalid expression structure in script file")
+                    handle ex =>
+                        (print ("Parse error in segment:\n" ^ 
+                                String.concatWith " " (List.map token_to_string segment) ^ "\n");
+                         raise ex)
+                val bindings = List.map process_segment segments
 
                 fun update_group (b as {fname, ...} : raw_binding, m) =
                     let val current = case StringMap.find (m, fname) of SOME l => l | NONE => []
@@ -1296,6 +1850,22 @@ fun repl (env : env, history : string list, script_file : string) =
                 end
         end
 
+fun print_output_node env node =
+    let
+        fun check_string current acc =
+            case whnf env current of
+                Nil => SOME (String.implode (List.rev acc))
+              | Cons (h, t) =>
+                (case whnf env h of
+                     Char c => check_string t (c :: acc)
+                   | _ => NONE)
+              | _ => NONE
+    in
+        case check_string node [] of
+            SOME s => print s
+          | NONE => print (print_node env node ^ "\n")
+    end
+
 fun main () =
     let
         val args = CommandLine.arguments ()
@@ -1303,7 +1873,8 @@ fun main () =
                               [] => "script.m"
                             | [f] => f
                             | _ => (print "Usage: miracula [script_file]\n"; OS.Process.exit OS.Process.failure)
-        val _ = if script_file = "script.m" then
+        val is_repl_mode = (script_file = "script.m")
+        val _ = if is_repl_mode then
                     (print "==================================================\n";
                      print " Environment-Sharing SML REPL                     \n";
                      print " Use '/e' to edit script.m, '/q' to exit          \n";
@@ -1311,8 +1882,23 @@ fun main () =
                 else ()
         val env_with_std = load_script_file "stdenv.m" StringMap.empty
         val initial_env = load_script_file script_file env_with_std
+
     in
-        repl (initial_env, [], script_file)
+        if is_repl_mode then
+            repl (initial_env, [], script_file)
+        else
+            (case StringMap.find (initial_env, "main") of
+                 SOME main_node =>
+                 let
+                     val result = whnf initial_env main_node
+                     val _ = print_output_node initial_env result
+                 in
+                     OS.Process.exit OS.Process.success
+                 end
+               | NONE =>
+                 repl (initial_env, [], script_file))
     end
+    handle RuntimeError msg => (print ("Runtime Error: " ^ msg ^ "\n"); OS.Process.exit OS.Process.failure)
+         | Fail msg => (print ("Error: " ^ msg ^ "\n"); OS.Process.exit OS.Process.failure)
 
 val _ = main ()
